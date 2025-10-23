@@ -145,3 +145,17 @@ AUTH_USER_MODEL = 'apps.user.User'
 
 # Weather API Settings (for demo purposes)
 WEATHER_API_KEY = os.getenv('WEATHER_API_KEY', 'demo-api-key-12345')
+
+# Redis Cache Settings
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'),
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'SOCKET_CONNECT_TIMEOUT': 5,
+            'SOCKET_TIMEOUT': 5,
+        },
+        'KEY_PREFIX': 'weather',
+    }
+}
