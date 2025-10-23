@@ -28,14 +28,14 @@ class APIRouter:
     API 라우터 (Lazy 헬스체크)
 
     책임:
-    1. 유저별 API 선택 (동적 할당)
+    1. 글로벌 API 선택 (동적 할당)
     2. 실패 시 즉시 폴백
     3. Redis 캐싱
     4. 실패 시점 기록 및 Lazy 복구
     """
 
-    # Redis 키 프리픽스
-    ROUTING_KEY_PREFIX = "routing"
+    # Redis 키
+    ROUTING_KEY = "routing:current"  # 현재 선택된 Provider (글로벌)
     FAILED_KEY_PREFIX = "api:failed"  # 마지막 실패 타임스탬프
     METRICS_KEY_PREFIX = "api:metrics"
 
@@ -76,14 +76,14 @@ class APIRouter:
         """
         요청 라우팅 및 폴백 처리 (Lazy 헬스체크)
 
-        1. Redis에서 유저 라우팅 캐시 조회
+        1. Redis에서 글로벌 라우팅 캐시 조회
         2. 캐시 없으면 동적 할당 (lazy 복구 시도 포함)
         3. Primary API 호출
         4. 실패 시 Fallback API 호출
         5. Redis에 결과 캐싱
 
         Args:
-            user_id: 사용자 ID
+            user_id: 사용자 ID (메트릭/로깅용)
             request_data: 날씨 예보 요청 데이터
 
         Returns:
@@ -95,11 +95,11 @@ class APIRouter:
         logger.info(f"[APIRouter] Routing request for user_id={user_id}")
 
         # 1. 캐시에서 할당된 Provider 조회
-        cached_provider_name = self._get_cached_routing(user_id)
+        cached_provider_name = self._get_cached_routing()
 
         # 2. 캐시 없으면 동적 할당 (lazy 복구 시도 포함)
         if cached_provider_name is None:
-            primary_provider_name = self._select_provider(user_id, request_data)
+            primary_provider_name = self._select_provider(request_data)
             logger.info(
                 f"[APIRouter] No cache, dynamically selected: {primary_provider_name}"
             )
@@ -111,53 +111,46 @@ class APIRouter:
 
         # 3. Primary API 호출 및 폴백 처리
         response = self._call_with_fallback(
-            user_id, primary_provider_name, request_data
+            primary_provider_name, request_data
         )
 
         return response
 
-    def _get_cached_routing(self, user_id: int) -> Optional[str]:
+    def _get_cached_routing(self) -> Optional[str]:
         """
-        Redis에서 유저 라우팅 캐시 조회
-
-        Args:
-            user_id: 사용자 ID
+        Redis에서 글로벌 라우팅 캐시 조회
 
         Returns:
             Optional[str]: Provider 이름 (없으면 None)
         """
-        cache_key = f"{self.ROUTING_KEY_PREFIX}:{user_id}"
-        cached_value = cache.get(cache_key)
+        cached_value = cache.get(self.ROUTING_KEY)
 
         if cached_value:
-            logger.debug(f"[APIRouter] Cache hit for user_id={user_id}: {cached_value}")
+            logger.debug(f"[APIRouter] Cache hit: {cached_value}")
         else:
-            logger.debug(f"[APIRouter] Cache miss for user_id={user_id}")
+            logger.debug(f"[APIRouter] Cache miss")
 
         return cached_value
 
-    def _set_cached_routing(self, user_id: int, provider_name: str):
+    def _set_cached_routing(self, provider_name: str):
         """
-        Redis에 유저 라우팅 캐시 저장
+        Redis에 글로벌 라우팅 캐시 저장
 
         Args:
-            user_id: 사용자 ID
             provider_name: Provider 이름
         """
-        cache_key = f"{self.ROUTING_KEY_PREFIX}:{user_id}"
-        cache.set(cache_key, provider_name, self.ROUTING_CACHE_TTL)
+        cache.set(self.ROUTING_KEY, provider_name, self.ROUTING_CACHE_TTL)
         logger.debug(
-            f"[APIRouter] Cached routing for user_id={user_id}: {provider_name}"
+            f"[APIRouter] Cached routing: {provider_name}"
         )
 
-    def _select_provider(self, user_id: int, request_data: WeatherForecastRequestSchema) -> str:
+    def _select_provider(self, request_data: WeatherForecastRequestSchema) -> str:
         """
         동적 Provider 선택 (Lazy 헬스체크 포함)
 
         실패한 Provider는 재시도 간격이 지났으면 복구 시도
 
         Args:
-            user_id: 사용자 ID
             request_data: 요청 데이터 (복구 시도용)
 
         Returns:
@@ -313,7 +306,6 @@ class APIRouter:
 
     def _call_with_fallback(
         self,
-        user_id: int,
         primary_provider_name: str,
         request_data: WeatherForecastRequestSchema,
     ) -> WeatherForecastResponseSchema:
@@ -321,7 +313,6 @@ class APIRouter:
         Primary API 호출 및 실패 시 폴백 처리
 
         Args:
-            user_id: 사용자 ID
             primary_provider_name: Primary Provider 이름
             request_data: 요청 데이터
 
@@ -341,7 +332,7 @@ class APIRouter:
             response = primary_provider.get_weather_forecast(request_data)
 
             # 성공 시: 캐시 저장 & 실패 기록 삭제 (복구)
-            self._set_cached_routing(user_id, primary_provider_name)
+            self._set_cached_routing(primary_provider_name)
             self._increment_success_metric(primary_provider_name)
             self._clear_failed_timestamp(primary_provider_name)
 
@@ -370,7 +361,7 @@ class APIRouter:
                     response = fallback_provider.get_weather_forecast(request_data)
 
                     # Fallback 성공 시: 캐시 업데이트 & 실패 기록 삭제
-                    self._set_cached_routing(user_id, fallback_name)
+                    self._set_cached_routing(fallback_name)
                     self._increment_success_metric(fallback_name)
                     self._clear_failed_timestamp(fallback_name)
 

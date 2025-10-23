@@ -19,15 +19,15 @@
 
 1. **비용 최적화**: 가능한 한 무료 A API를 사용하되, 필요시 B API로 전환
 2. **고가용성**: A API 장애 시 자동으로 B API로 폴백
-3. **동적 부하 분산**: 사용자별로 동적으로 API 할당 (부하/비용 기준)
+3. **일관성**: 모든 사용자가 동일한 Provider 사용 (실패 상태는 글로벌)
 4. **자동 복구**: 장애가 해결되면 자동으로 원래 API로 복귀
 
 ### 요구사항
 
-✅ **동적 할당**: 부하나 비용을 고려하여 실시간으로 API 선택
+✅ **동적 할당**: 비용을 고려하여 실시간으로 API 선택 (무료 우선)
 ✅ **즉시 폴백**: API 호출 실패 시 즉시 다른 API로 재시도
-✅ **Redis 캐싱**: 유저별 라우팅 정보를 캐시하여 성능 향상
-✅ **자동 복구**: 헬스체크를 통해 API 상태 모니터링 및 자동 복귀
+✅ **Redis 캐싱**: 글로벌 라우팅 정보를 캐시하여 성능 향상
+✅ **자동 복구**: Lazy 헬스체크를 통해 API 상태 모니터링 및 자동 복귀
 
 ---
 
@@ -49,9 +49,9 @@
 ┌──────────────────┐         ┌─────────────┐
 │   API Router     │◄────────┤    Redis    │
 │                  │         │ (Routing    │
-│ - 유저별 할당    │         │  Cache)     │
+│ - 글로벌 할당    │         │  Cache)     │
 │ - 폴백 로직      │         └─────────────┘
-│ - 헬스체크 참조  │
+│ - Lazy 헬스체크  │
 └────────┬─────────┘
          │
     ┌────┴────┐
@@ -60,13 +60,6 @@
 │ A API  │ │ B API  │
 │Provider│ │Provider│
 └────────┘ └────────┘
-    ▲         ▲
-    │         │
-    └────┬────┘
-         │
-┌────────────────┐
-│ Health Checker │ (주기적 실행)
-└────────────────┘
 ```
 
 ### 핵심 컴포넌트
@@ -100,7 +93,7 @@ class IWeatherAPIProvider(Protocol):
 ```
 
 #### 2. API Router
-유저별 API 할당 및 폴백 처리
+글로벌 API 할당, 폴백 처리 및 Lazy Health Check
 
 ```python
 class APIRouter:
@@ -108,9 +101,10 @@ class APIRouter:
     API 라우팅 및 폴백 처리
 
     책임:
-    1. 유저별 API 선택 (동적 할당)
+    1. 글로벌 API 선택 (동적 할당)
     2. 실패 시 즉시 폴백
     3. Redis 캐싱
+    4. Lazy Health Check (요청 시 복구 시도)
     """
 
     def route_request(
@@ -121,34 +115,24 @@ class APIRouter:
         """
         요청 라우팅
 
-        1. Redis에서 유저 라우팅 캐시 조회
+        1. Redis에서 글로벌 라우팅 캐시 조회
         2. 캐시 없으면 동적 할당
-        3. Primary API 호출
-        4. 실패 시 Fallback API 호출
+        3. 실패한 Provider가 있으면 Lazy 헬스체크 시도 (1분 경과 시)
+        4. Primary API 호출
+        5. 실패 시 Fallback API 호출
+
+        Note: user_id는 로깅/메트릭용으로만 사용
         """
         ...
-```
 
-#### 3. Health Checker
-주기적으로 각 API 상태 확인
+    def _try_recovery(self, provider: IWeatherAPIProvider) -> bool:
+        """
+        Lazy 헬스체크 - 요청 시점에 복구 시도
 
-```python
-class HealthChecker:
-    """
-    API 헬스체크
-
-    주기적으로 실행하여:
-    1. 각 API 상태 확인
-    2. Redis에 상태 저장
-    3. 장애 복구 감지
-    """
-
-    def check_all_providers(self) -> Dict[str, bool]:
-        """모든 Provider 헬스체크"""
-        ...
-
-    def update_routing_on_recovery(self, provider_name: str):
-        """복구 감지 시 라우팅 업데이트"""
+        1. 실패 타임스탬프 확인
+        2. 1분 경과했으면 health_check() 호출
+        3. 성공 시 실패 기록 삭제 및 즉시 복구
+        """
         ...
 ```
 
@@ -159,25 +143,26 @@ class HealthChecker:
 ### 키 구조
 
 ```
-# 유저별 라우팅 정보 (1시간 TTL)
-weather:routing:{user_id} → "A" or "B"
+# 글로벌 라우팅 정보 (1시간 TTL)
+routing:current → "scraping" or "external"
 
 # API 실패 타임스탬프 (1시간 TTL)
-weather:api:failed:A → 1729732800.123  # Unix timestamp
-weather:api:failed:B → 1729732850.456
+api:failed:scraping → 1729732800.123  # Unix timestamp
+api:failed:external → 1729732850.456
 
 # API 사용 메트릭 (1시간 TTL)
-weather:api:metrics:A:success → 1000
-weather:api:metrics:A:failure → 5
-weather:api:metrics:B:success → 950
-weather:api:metrics:B:failure → 2
+api:metrics:scraping:success → 1000
+api:metrics:scraping:failure → 5
+api:metrics:external:success → 950
+api:metrics:external:failure → 2
 ```
 
 ### 캐싱 전략
 
-1. **유저 라우팅 캐시**: 1시간 TTL
-   - DB 조회 없이 빠른 라우팅 결정
+1. **글로벌 라우팅 캐시**: 1시간 TTL
+   - 현재 선택된 Provider 저장 (모든 유저 공유)
    - 성공 시 캐시 저장
+   - Redis 키 개수: O(1) - 유저 수와 무관
 
 2. **실패 타임스탬프 캐시**: 1시간 TTL
    - 실패 시 현재 타임스탬프 저장
@@ -197,10 +182,10 @@ weather:api:metrics:B:failure → 2
 ```
 1. 유저 요청 → WeatherService
 2. APIRouter.route_request(user_id, request_data)
-3. Redis 조회: weather:routing:{user_id}
-   - 캐시 HIT → "A" 반환
-   - 캐시 MISS → 동적 할당 (부하/비용 기준) → "A" 할당 → Redis 저장 (1시간 TTL)
-4. A API Provider 호출
+3. Redis 조회: routing:current
+   - 캐시 HIT → "scraping" 반환
+   - 캐시 MISS → 동적 할당 (비용 기준) → "scraping" 할당 → Redis 저장 (1시간 TTL)
+4. scraping API Provider 호출
 5. 성공 → 결과 반환
 ```
 
@@ -209,14 +194,14 @@ weather:api:metrics:B:failure → 2
 ```
 1. 유저 요청 → WeatherService
 2. APIRouter.route_request(user_id, request_data)
-3. Redis에서 "A" 할당 확인
-4. A API Provider 호출
+3. Redis에서 "scraping" 할당 확인
+4. scraping API Provider 호출
 5. 실패 (타임아웃, 5xx 에러 등)
-6. 즉시 B API Provider 호출 (폴백)
-7. B API 성공 → 결과 반환
+6. 즉시 external API Provider 호출 (폴백)
+7. external API 성공 → 결과 반환
 8. Redis 업데이트:
-   - weather:api:failed:A → timestamp (실패 시점 기록)
-   - weather:routing:{user_id} → "B" (다음 요청부터 B 사용)
+   - api:failed:scraping → timestamp (실패 시점 기록)
+   - routing:current → "external" (다음 요청부터 external 사용)
 ```
 
 ### Lazy 헬스체크 및 자동 복구
@@ -225,16 +210,18 @@ weather:api:metrics:B:failure → 2
 [요청 시점에 복구 시도]
 1. 유저 요청 → WeatherService
 2. APIRouter에서 Provider 선택 시:
-   - A API 실패 기록 확인
+   - scraping API 실패 기록 확인
    - 1분 경과 여부 확인
 3. 1분 경과했으면 Lazy 헬스체크 시도
-   - A API health_check() 호출
+   - scraping API health_check() 호출
 4. 헬스체크 성공 → 복구!
    - 실패 기록 삭제
-   - A API 선택 (무료)
+   - scraping API 선택 (무료)
+   - routing:current → "scraping" 업데이트
 5. 헬스체크 실패 → 여전히 실패 상태
    - 타임스탬프 갱신
-   - B API 선택 (폴백)
+   - external API 선택 (폴백)
+   - routing:current → "external" 유지
 ```
 
 **장점:**
