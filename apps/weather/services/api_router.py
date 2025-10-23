@@ -1,12 +1,13 @@
 # apps/weather/services/api_router.py
 """
-API 라우터
+API 라우터 (Lazy 헬스체크 버전)
 
 유저별 API 선택 및 폴백 처리를 담당
+실패한 Provider는 일정 시간 후 요청 시점에 복구 시도
 """
 
 import logging
-import json
+import time
 from typing import Dict, List, Optional
 from django.core.cache import cache
 from django.conf import settings
@@ -24,22 +25,26 @@ logger = logging.getLogger(__name__)
 
 class APIRouter:
     """
-    API 라우터
+    API 라우터 (Lazy 헬스체크)
 
     책임:
     1. 유저별 API 선택 (동적 할당)
     2. 실패 시 즉시 폴백
     3. Redis 캐싱
-    4. 헬스 상태 업데이트
+    4. 실패 시점 기록 및 Lazy 복구
     """
 
     # Redis 키 프리픽스
     ROUTING_KEY_PREFIX = "routing"
-    HEALTH_KEY_PREFIX = "api:health"
+    FAILED_KEY_PREFIX = "api:failed"  # 마지막 실패 타임스탬프
     METRICS_KEY_PREFIX = "api:metrics"
 
     # 캐시 TTL
     ROUTING_CACHE_TTL = 3600  # 1시간
+    FAILED_CACHE_TTL = 3600  # 1시간
+
+    # 재시도 간격 (초)
+    RETRY_INTERVAL_SECONDS = 60  # 1분
 
     def __init__(self, providers: Optional[List[IWeatherAPIProvider]] = None):
         """
@@ -69,10 +74,10 @@ class APIRouter:
         self, user_id: int, request_data: WeatherForecastRequestSchema
     ) -> WeatherForecastResponseSchema:
         """
-        요청 라우팅 및 폴백 처리
+        요청 라우팅 및 폴백 처리 (Lazy 헬스체크)
 
         1. Redis에서 유저 라우팅 캐시 조회
-        2. 캐시 없으면 동적 할당
+        2. 캐시 없으면 동적 할당 (lazy 복구 시도 포함)
         3. Primary API 호출
         4. 실패 시 Fallback API 호출
         5. Redis에 결과 캐싱
@@ -92,9 +97,9 @@ class APIRouter:
         # 1. 캐시에서 할당된 Provider 조회
         cached_provider_name = self._get_cached_routing(user_id)
 
-        # 2. 캐시 없으면 동적 할당
+        # 2. 캐시 없으면 동적 할당 (lazy 복구 시도 포함)
         if cached_provider_name is None:
-            primary_provider_name = self._select_provider(user_id)
+            primary_provider_name = self._select_provider(user_id, request_data)
             logger.info(
                 f"[APIRouter] No cache, dynamically selected: {primary_provider_name}"
             )
@@ -145,39 +150,166 @@ class APIRouter:
             f"[APIRouter] Cached routing for user_id={user_id}: {provider_name}"
         )
 
-    def _select_provider(self, user_id: int) -> str:
+    def _select_provider(self, user_id: int, request_data: WeatherForecastRequestSchema) -> str:
         """
-        동적 Provider 선택
+        동적 Provider 선택 (Lazy 헬스체크 포함)
 
-        부하/비용/헬스 상태를 고려하여 최적의 Provider 선택
+        실패한 Provider는 재시도 간격이 지났으면 복구 시도
 
         Args:
             user_id: 사용자 ID
+            request_data: 요청 데이터 (복구 시도용)
 
         Returns:
             str: 선택된 Provider 이름
         """
-        # 각 Provider의 헬스 상태 확인
-        healthy_providers = []
-        for provider_name, provider in self.provider_map.items():
-            health_status = self._get_health_status(provider_name)
-            if health_status.get("status") == "healthy":
-                healthy_providers.append(provider_name)
+        available_providers = []
 
-        if not healthy_providers:
-            # 모두 unhealthy면 기본값 사용 (scraping)
-            logger.warning("[APIRouter] No healthy providers, using default: scraping")
+        for provider_name in self.provider_map.keys():
+            # 재시도 가능한지 확인
+            if self._should_retry_provider(provider_name):
+                # Lazy 복구 시도
+                logger.info(f"[APIRouter] Attempting lazy recovery for {provider_name}")
+                recovered = self._try_recovery(provider_name, request_data)
+
+                if recovered:
+                    logger.info(f"[APIRouter] {provider_name} recovered!")
+                    available_providers.append(provider_name)
+                else:
+                    logger.warning(f"[APIRouter] {provider_name} still unhealthy")
+            elif not self._is_provider_failed(provider_name):
+                # 실패 기록이 없으면 사용 가능
+                available_providers.append(provider_name)
+
+        if not available_providers:
+            # 모두 실패 상태면 기본값 사용 (scraping)
+            logger.warning("[APIRouter] No available providers, using default: scraping")
             return "scraping"
 
         # 비용 기반 선택: 무료 Provider 우선 (scraping)
-        # 실제로는 더 복잡한 로직 (부하, 메트릭 등) 고려 가능
-        if "scraping" in healthy_providers:
+        if "scraping" in available_providers:
             logger.info("[APIRouter] Selected scraping provider (free)")
             return "scraping"
         else:
-            # scraping이 unhealthy면 external 사용
-            logger.info("[APIRouter] Scraping unhealthy, selected external provider")
-            return healthy_providers[0]
+            # scraping이 없으면 다른 Provider 사용
+            selected = available_providers[0]
+            logger.info(f"[APIRouter] Selected {selected} provider")
+            return selected
+
+    def _should_retry_provider(self, provider_name: str) -> bool:
+        """
+        Provider가 재시도 가능한지 확인
+
+        실패한 지 RETRY_INTERVAL_SECONDS 이상 경과했는지 확인
+
+        Args:
+            provider_name: Provider 이름
+
+        Returns:
+            bool: True=재시도 가능, False=아직 대기 중
+        """
+        last_failed_at = self._get_last_failed_timestamp(provider_name)
+
+        if last_failed_at is None:
+            # 실패 기록 없음
+            return False
+
+        elapsed = time.time() - last_failed_at
+
+        if elapsed >= self.RETRY_INTERVAL_SECONDS:
+            logger.debug(
+                f"[APIRouter] {provider_name} retry interval elapsed ({elapsed:.1f}s)"
+            )
+            return True
+        else:
+            logger.debug(
+                f"[APIRouter] {provider_name} still in cooldown ({elapsed:.1f}s / {self.RETRY_INTERVAL_SECONDS}s)"
+            )
+            return False
+
+    def _try_recovery(self, provider_name: str, request_data: WeatherForecastRequestSchema) -> bool:
+        """
+        Provider 복구 시도 (헬스체크)
+
+        Args:
+            provider_name: Provider 이름
+            request_data: 요청 데이터 (실제 호출 대신 헬스체크)
+
+        Returns:
+            bool: True=복구 성공, False=여전히 실패
+        """
+        provider = self.provider_map.get(provider_name)
+        if provider is None:
+            return False
+
+        try:
+            # 헬스체크 시도
+            is_healthy = provider.health_check()
+
+            if is_healthy:
+                # 복구 성공: 실패 기록 삭제
+                self._clear_failed_timestamp(provider_name)
+                logger.info(f"[APIRouter] {provider_name} recovery successful")
+                return True
+            else:
+                # 여전히 실패: 타임스탬프 갱신
+                self._mark_provider_failed(provider_name)
+                logger.warning(f"[APIRouter] {provider_name} recovery failed")
+                return False
+
+        except Exception as e:
+            # 헬스체크 실패: 타임스탬프 갱신
+            self._mark_provider_failed(provider_name)
+            logger.error(f"[APIRouter] {provider_name} recovery exception: {e}")
+            return False
+
+    def _is_provider_failed(self, provider_name: str) -> bool:
+        """
+        Provider가 실패 상태인지 확인
+
+        Args:
+            provider_name: Provider 이름
+
+        Returns:
+            bool: True=실패 상태, False=정상
+        """
+        return self._get_last_failed_timestamp(provider_name) is not None
+
+    def _get_last_failed_timestamp(self, provider_name: str) -> Optional[float]:
+        """
+        마지막 실패 타임스탬프 조회
+
+        Args:
+            provider_name: Provider 이름
+
+        Returns:
+            Optional[float]: Unix timestamp (없으면 None)
+        """
+        cache_key = f"{self.FAILED_KEY_PREFIX}:{provider_name}"
+        timestamp = cache.get(cache_key)
+        return float(timestamp) if timestamp is not None else None
+
+    def _mark_provider_failed(self, provider_name: str):
+        """
+        Provider를 실패 상태로 마킹 (타임스탬프 저장)
+
+        Args:
+            provider_name: Provider 이름
+        """
+        cache_key = f"{self.FAILED_KEY_PREFIX}:{provider_name}"
+        cache.set(cache_key, time.time(), timeout=self.FAILED_CACHE_TTL)
+        logger.info(f"[APIRouter] Marked {provider_name} as failed")
+
+    def _clear_failed_timestamp(self, provider_name: str):
+        """
+        Provider 실패 기록 삭제 (복구 완료)
+
+        Args:
+            provider_name: Provider 이름
+        """
+        cache_key = f"{self.FAILED_KEY_PREFIX}:{provider_name}"
+        cache.delete(cache_key)
+        logger.info(f"[APIRouter] Cleared failed status for {provider_name}")
 
     def _call_with_fallback(
         self,
@@ -208,9 +340,10 @@ class APIRouter:
             logger.info(f"[APIRouter] Calling primary provider: {primary_provider_name}")
             response = primary_provider.get_weather_forecast(request_data)
 
-            # 성공 시 캐시 저장
+            # 성공 시: 캐시 저장 & 실패 기록 삭제 (복구)
             self._set_cached_routing(user_id, primary_provider_name)
             self._increment_success_metric(primary_provider_name)
+            self._clear_failed_timestamp(primary_provider_name)
 
             return response
 
@@ -219,7 +352,7 @@ class APIRouter:
                 f"[APIRouter] Primary provider failed: {primary_provider_name}, error: {e}"
             )
             self._increment_failure_metric(primary_provider_name)
-            self._update_health_status(primary_provider_name, "unhealthy", str(e))
+            self._mark_provider_failed(primary_provider_name)
 
             # Fallback Provider 선택 (primary가 아닌 다른 Provider)
             fallback_providers = [
@@ -236,9 +369,10 @@ class APIRouter:
                     fallback_provider = self.provider_map[fallback_name]
                     response = fallback_provider.get_weather_forecast(request_data)
 
-                    # Fallback 성공 시 캐시 업데이트 (다음부터 이 Provider 사용)
+                    # Fallback 성공 시: 캐시 업데이트 & 실패 기록 삭제
                     self._set_cached_routing(user_id, fallback_name)
                     self._increment_success_metric(fallback_name)
+                    self._clear_failed_timestamp(fallback_name)
 
                     logger.info(
                         f"[APIRouter] Fallback successful: {fallback_name}"
@@ -250,50 +384,11 @@ class APIRouter:
                         f"[APIRouter] Fallback provider failed: {fallback_name}, error: {fallback_error}"
                     )
                     self._increment_failure_metric(fallback_name)
-                    self._update_health_status(fallback_name, "unhealthy", str(fallback_error))
+                    self._mark_provider_failed(fallback_name)
                     continue
 
             # 모든 Provider 실패
             raise Exception("All providers failed")
-
-    def _get_health_status(self, provider_name: str) -> dict:
-        """
-        Redis에서 Provider 헬스 상태 조회
-
-        Args:
-            provider_name: Provider 이름
-
-        Returns:
-            dict: 헬스 상태 (없으면 기본값: healthy)
-        """
-        cache_key = f"{self.HEALTH_KEY_PREFIX}:{provider_name}"
-        cached_status = cache.get(cache_key)
-
-        if cached_status:
-            return json.loads(cached_status)
-        else:
-            # 캐시 없으면 healthy로 가정
-            return {"status": "healthy", "last_check": None, "last_error": None}
-
-    def _update_health_status(self, provider_name: str, status: str, error: Optional[str] = None):
-        """
-        Redis에 Provider 헬스 상태 저장
-
-        Args:
-            provider_name: Provider 이름
-            status: 상태 ("healthy" or "unhealthy")
-            error: 에러 메시지 (선택)
-        """
-        from datetime import datetime
-
-        cache_key = f"{self.HEALTH_KEY_PREFIX}:{provider_name}"
-        health_data = {
-            "status": status,
-            "last_check": datetime.now().isoformat(),
-            "last_error": error,
-        }
-        cache.set(cache_key, json.dumps(health_data), timeout=None)  # 무기한 저장
-        logger.info(f"[APIRouter] Updated health status for {provider_name}: {status}")
 
     def _increment_success_metric(self, provider_name: str):
         """성공 메트릭 증가"""

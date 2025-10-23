@@ -162,30 +162,31 @@ class HealthChecker:
 # 유저별 라우팅 정보 (1시간 TTL)
 weather:routing:{user_id} → "A" or "B"
 
-# API 헬스 상태
-weather:api:health:A → {"status": "healthy", "last_check": "2024-10-24T10:30:00", "last_error": null}
-weather:api:health:B → {"status": "healthy", "last_check": "2024-10-24T10:30:00", "last_error": null}
+# API 실패 타임스탬프 (1시간 TTL)
+weather:api:failed:A → 1729732800.123  # Unix timestamp
+weather:api:failed:B → 1729732850.456
 
-# API 사용 메트릭 (선택적)
-weather:api:metrics:A → {"success": 1000, "failure": 5, "last_hour_requests": 120}
-weather:api:metrics:B → {"success": 950, "failure": 2, "last_hour_requests": 80}
-
-# 전역 설정
-weather:config:allocation_ratio → {"A": 0.8, "B": 0.2}  # A API 80%, B API 20%
+# API 사용 메트릭 (1시간 TTL)
+weather:api:metrics:A:success → 1000
+weather:api:metrics:A:failure → 5
+weather:api:metrics:B:success → 950
+weather:api:metrics:B:failure → 2
 ```
 
 ### 캐싱 전략
 
 1. **유저 라우팅 캐시**: 1시간 TTL
    - DB 조회 없이 빠른 라우팅 결정
-   - 장애 복구 시 자동 만료로 재할당
+   - 성공 시 캐시 저장
 
-2. **헬스 상태 캐시**: 무기한 (수동 업데이트)
-   - Health Checker가 주기적으로 갱신
-   - 장애 감지 시 즉시 업데이트
+2. **실패 타임스탬프 캐시**: 1시간 TTL
+   - 실패 시 현재 타임스탬프 저장
+   - 재시도 간격 확인용 (1분)
+   - 복구 성공 시 즉시 삭제
 
 3. **메트릭 캐시**: 1시간 TTL
-   - 부하 기반 동적 할당에 활용
+   - 성공/실패 카운트 추적
+   - 모니터링 및 분석용
 
 ---
 
@@ -214,23 +215,32 @@ weather:config:allocation_ratio → {"A": 0.8, "B": 0.2}  # A API 80%, B API 20%
 6. 즉시 B API Provider 호출 (폴백)
 7. B API 성공 → 결과 반환
 8. Redis 업데이트:
-   - weather:api:health:A → "unhealthy"
+   - weather:api:failed:A → timestamp (실패 시점 기록)
    - weather:routing:{user_id} → "B" (다음 요청부터 B 사용)
 ```
 
-### 헬스체크 및 자동 복구
+### Lazy 헬스체크 및 자동 복구
 
 ```
-[Background Job - 1분마다 실행]
-1. HealthChecker.check_all_providers()
-2. A API 헬스체크 → 성공
-3. Redis 조회: weather:api:health:A → "unhealthy"
-4. 복구 감지!
-5. Redis 업데이트:
-   - weather:api:health:A → "healthy"
-   - weather:routing:* 캐시 삭제 (다음 요청 시 재할당)
-6. 다음 요청부터 자동으로 A API 사용 (비용 절감)
+[요청 시점에 복구 시도]
+1. 유저 요청 → WeatherService
+2. APIRouter에서 Provider 선택 시:
+   - A API 실패 기록 확인
+   - 1분 경과 여부 확인
+3. 1분 경과했으면 Lazy 헬스체크 시도
+   - A API health_check() 호출
+4. 헬스체크 성공 → 복구!
+   - 실패 기록 삭제
+   - A API 선택 (무료)
+5. 헬스체크 실패 → 여전히 실패 상태
+   - 타임스탬프 갱신
+   - B API 선택 (폴백)
 ```
+
+**장점:**
+- Cron 불필요 (인프라 간소화)
+- 실제 트래픽이 있을 때만 복구 시도
+- 즉각적인 복구 (요청이 있을 때)
 
 ---
 
@@ -278,20 +288,20 @@ CACHES = {
 2. `_select_provider()`: 동적 할당 로직
 3. `_call_with_fallback()`: 폴백 처리
 
-### Phase 4: Health Checker 구현
+### Phase 4: Lazy 헬스체크 로직 (APIRouter에 통합)
 
-**파일 생성:**
-- `apps/weather/services/health_checker.py`
-- `apps/weather/management/commands/check_api_health.py` - Django 관리 명령어
+**APIRouter에 추가된 메서드:**
+- `_should_retry_provider()` - 재시도 가능 여부 확인 (1분 경과?)
+- `_try_recovery()` - Lazy 헬스체크 시도
+- `_mark_provider_failed()` - 실패 타임스탬프 저장
+- `_clear_failed_timestamp()` - 복구 시 실패 기록 삭제
+- `_is_provider_failed()` - 실패 상태 확인
+- `_get_last_failed_timestamp()` - 마지막 실패 시간 조회
 
-**실행 방법:**
-```bash
-# 수동 실행
-python manage.py check_api_health
-
-# Cron 등록 (1분마다)
-* * * * * cd /path/to/project && python manage.py check_api_health
-```
+**동작 방식:**
+- 요청이 올 때마다 실패한 Provider 확인
+- 1분 경과했으면 자동으로 헬스체크 시도
+- 1회 성공 시 즉시 복구
 
 ### Phase 5: WeatherService 통합
 
@@ -301,42 +311,3 @@ python manage.py check_api_health
 **변경사항:**
 - 기존 api_client 대신 api_router 사용
 - 라우팅 로직을 Router에 위임
-
-### Phase 6: 테스트 작성
-
-**파일 생성:**
-- `tests/weather/test_api_router.py`
-- `tests/weather/test_health_checker.py`
-- `tests/weather/test_providers.py`
-
-**테스트 시나리오:**
-1. 정상 라우팅 (A → 성공)
-2. 폴백 (A → 실패 → B → 성공)
-3. 헬스체크 및 복구
-4. 동적 할당 로직
-5. Redis 캐싱
-
----
-
-## 확장 가능성
-
-### 1. Provider 추가
-새로운 C API 추가 시:
-- `apps/weather/services/api_providers/c_provider.py` 생성
-- IWeatherAPIProvider 인터페이스 구현
-- APIRouter에 등록만 하면 자동 지원
-
-### 2. 라우팅 전략 변경
-- 현재: 부하/비용 기반 동적 할당
-- 확장: 지역별, 시간대별, 데이터 타입별 라우팅 가능
-
-### 3. Circuit Breaker 패턴 추가
-- 연속 실패 시 일정 시간 동안 해당 API 차단
-- 점진적 복구 (Half-Open 상태)
-
-### 4. 모니터링 및 알림
-- API 사용량, 에러율 대시보드
-- 장애 발생 시 Slack/이메일 알림
-- 비용 추적 및 예산 알림
-
----
